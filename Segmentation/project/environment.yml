@@ -1,0 +1,51 @@
+name: greenvista
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # === Core scientific stack ===
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - seaborn
+  # === Point cloud I/O ===
+  - laspy
+  - lazrs-python  # LAZ compression support for laspy
+  # === Geospatial (tree shapes, plot polygons, CRS) ===
+  - geopandas     # brings shapely / pyproj / fiona / gdal
+  - openpyxl      # read the .xlsx field & result sheets
+  # === Testing ===
+  - pytest
+  # === Machine Learning ===
+  - scikit-learn
+  - scikit-image        # watershed baseline (greenvista/segmentation/watershed.py)
+  - joblib
+  # === Jupyter ===
+  - jupyterlab
+  - ipywidgets
+  # === Utilities ===
+  - tqdm
+  - pyyaml
+  - h5py
+  - plyfile
+  - colorama
+  - rich
+  # === Pip packages ===
+  - pip
+  - pip:
+      # PyTorch 2.10.0 + CUDA 12.8 (Blackwell SM 120 support)
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.10.0+cu128
+      - torchvision==0.25.0+cu128
+      - torchaudio==2.10.0+cu128
+      # 3D Point Cloud processing (pip to avoid conda BLAS conflicts)
+      - open3d==0.19.0
+      # ML / Boosting
+      - xgboost>=3.2.0
+      - shap
+      # Point cloud utilities
+      - pyntcloud
+      # Misc
+      - tensorboard
+      - wandb

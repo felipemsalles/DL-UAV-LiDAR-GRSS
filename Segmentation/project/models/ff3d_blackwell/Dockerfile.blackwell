@@ -1,0 +1,371 @@
+###############################################################################
+# ForestFormer3D – Blackwell (SM 12.0) Rebuild
+# Target GPU: NVIDIA RTX 5060 Laptop (Blackwell, SM 12.0)
+#
+# Base: CUDA 12.8.0 + cuDNN (devel) on Ubuntu 22.04
+# PyTorch: 2.7.1+cu128  (minimum version supporting SM 12.0)
+# Python:  3.10          (Ubuntu 22.04 default, matches AzharSindhi ME fork)
+#
+# What this image builds:
+#   1. CUDA 12.8 base — required to compile SM 12.0 kernels
+#   2. PyTorch 2.7.1+cu128 — earliest release with Blackwell support
+#   3. cumm from source (0.8.2+) with an SM 12.0 patch
+#   4. spconv from source against that cumm
+#   5. MinkowskiEngine from the AzharSindhi/MinkowskiEngineCuda13 fork
+#   6. mmcv from source (no prebuilt wheel for cu128)
+#   7. torch-scatter from the PyG prebuilt wheels for torch 2.7+cu128
+#   8. segmentator under /opt, where a bind mount cannot shadow it
+#
+# Build: docker build -f Dockerfile.blackwell -t ff3d-blackwell .
+# Time:  ~60-90 min (cumm+spconv CUDA kernel compilation dominates)
+###############################################################################
+
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ─── System dependencies ───────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    ninja-build \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libglib2.0-0 \
+    libopenblas-dev \
+    rsync \
+    wget \
+    unzip \
+    zip \
+    software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make 'python' point to python3 (Ubuntu 22.04 doesn't create this symlink)
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+
+# CUDA paths (nvidia/cuda devel images set these, but be explicit)
+ENV PATH=/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ENV CUDA_HOME=/usr/local/cuda
+
+# ─── Upgrade pip & essential build tools ───────────────────────────────────────
+RUN pip install --no-cache-dir --upgrade \
+    pip setuptools wheel ninja
+
+# ─── PyTorch 2.7.1 + CUDA 12.8 ───────────────────────────────────────────────
+# PyTorch 2.7 is the minimum version with SM 12.0 (Blackwell) support.
+# Using 2.7.1 (not 2.10) because torch-scatter has prebuilt wheels for 2.7.
+RUN pip install --no-cache-dir \
+    torch==2.7.1 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Verify PyTorch installed correctly (no GPU needed, just check CUDA build info)
+RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')"
+
+# ─── Pin NumPy < 2 ────────────────────────────────────────────────────────────
+# PyTorch 2.7.1 installs numpy 2.2.6, but many pinned dependencies (opencv-python
+# 4.10, scipy 1.10, numba 0.57, scikit-learn 1.2, etc.) ship prebuilt wheels
+# compiled against NumPy 1.x. NumPy 2.0 broke the C ABI — any C extension built
+# against NumPy 1.x crashes with "AttributeError: _ARRAY_API not found" on NumPy 2.
+# Pinning to numpy<2 BEFORE compiling anything (cumm, spconv, mmcv, etc.) ensures
+# all C extensions — both source-built and prebuilt wheels — use the same ABI.
+# PyTorch 2.7.1 requires numpy>=1.23.5; numpy 1.26.4 is the latest 1.x release.
+RUN pip install --no-cache-dir "numpy<2"
+
+# ─── Build tools for cumm/spconv ──────────────────────────────────────────────
+# pccm = code generator, ccimport = C++ import system, both needed by cumm
+RUN pip install --no-cache-dir \
+    pccm \
+    ccimport \
+    pybind11 \
+    lark \
+    fire
+
+# ─── cumm from source (patched for Blackwell SM 12.0) ─────────────────────────
+# cumm 0.8.2 already has "12.0" in supported_arches, but has a bug:
+# algo_can_be_nvrtc_compiled() maps CUDA 12.8 to max arch (10,0) instead of
+# (12,0). This prevents NVRTC from JIT-compiling kernels for SM 12.0 at runtime.
+# We fix this one-line bug and build from source with SM 12.0 targets.
+#
+# Source: https://github.com/FindDefinition/cumm
+# Bug context: https://github.com/FindDefinition/cumm/issues/35
+
+ENV CUMM_CUDA_ARCH_LIST="12.0"
+
+RUN git clone https://github.com/FindDefinition/cumm.git /tmp/cumm
+
+# Apply Blackwell SM 12.0 patches to cumm/common.py:
+#   1. Fix NVRTC max arch: CUDA 12.8 → (12,0) instead of (10,0)
+#   2. Add Blackwell to named_arches (for GPU name recognition)
+# Patch 3 (RTX 50xx GPU regex) skipped — CUMM_CUDA_ARCH_LIST env var bypasses it.
+# Patch 1: Fix NVRTC max arch — CUDA 12.8 supports sm_120, not sm_100
+# Without this, runtime NVRTC kernel compilation fails on Blackwell.
+RUN cd /tmp/cumm \
+    && sed -i 's/((12, 8), (10, 0))/((12, 8), (12, 0))/' cumm/common.py \
+    && echo "Patch 1 applied: NVRTC max arch fixed"
+
+# Patch 2: Add Blackwell to named_arches (after Lovelace line)
+RUN cd /tmp/cumm \
+    && sed -i "/('Lovelace', '8.9+PTX'),/a\\    ('Blackwell', '12.0+PTX')," cumm/common.py \
+    && echo "Patch 2 applied: Blackwell added to named_arches"
+
+# Verify patches applied correctly
+RUN cd /tmp/cumm \
+    && grep -n "(12, 0)" cumm/common.py \
+    && grep -n "Blackwell" cumm/common.py \
+    && echo "Patch verification passed"
+
+# Build cumm from source. CUMM_DISABLE_JIT=1 is REQUIRED for non-editable installs:
+# it triggers C++ extension compilation (cumm/core_cc) and runs CopyHeaderCallback
+# which copies include/tensorview headers into the installed package. Without it,
+# 'import cumm' fails with AssertionError (TENSORVIEW_INCLUDE_PATH not found).
+# --no-build-isolation reuses our already-installed pccm/ccimport build tools.
+# Building for a single arch (12.0) is much faster than building for all arches.
+RUN cd /tmp/cumm \
+    && CUMM_DISABLE_JIT=1 \
+       CUMM_CUDA_ARCH_LIST="12.0" \
+       MAX_JOBS=4 \
+       pip install --no-cache-dir --no-build-isolation . \
+    && rm -rf /tmp/cumm
+
+RUN python -c "import cumm; print(f'cumm installed: {cumm.__version__}')"
+
+# ─── spconv from source ───────────────────────────────────────────────────────
+# spconv 2.3.8 has no cu128 wheel. We build from source against our patched cumm.
+# The setup.py pins cumm to <0.8.0, but we need 0.8.2. We remove that constraint
+# and install with --no-deps since cumm is already installed.
+#
+# Source: https://github.com/traveller59/spconv
+# Context: https://github.com/traveller59/spconv/issues/746
+
+RUN git clone https://github.com/traveller59/spconv.git /tmp/spconv \
+    && cd /tmp/spconv \
+    && git checkout v2.3.8
+
+# Patch spconv's setup.py: remove the cumm-cuXXX version pin
+# (our cumm is installed from source as 'cumm', not 'cumm-cu128')
+# The upstream pin is: "cumm-cu{ver}>=0.7.11, <0.8.0"
+# We replace cumm-cuXXX with just "cumm" since ours is built from source.
+RUN cd /tmp/spconv \
+    && sed -i 's/"cumm-cu[^"]*"/"cumm"/g' setup.py \
+    && echo "Patched spconv setup.py: cumm dependency relaxed" \
+    && grep -n "cumm" setup.py
+
+# Build spconv with SPCONV_DISABLE_JIT=1 to compile the core_cc C++ extension.
+# Without this flag, setup.py sets ext_modules=[] and produces a pure-Python
+# wheel (py3-none-any) — spconv.core_cc.so is never compiled, causing
+# "No module named 'spconv.core_cc'" at runtime.
+# --no-build-isolation is required because setup.py imports cumm + spconv at
+# the top level when SPCONV_DISABLE_JIT=1.
+RUN cd /tmp/spconv \
+    && SPCONV_DISABLE_JIT=1 \
+       CUMM_CUDA_ARCH_LIST="12.0" \
+       CUMM_CUDA_VERSION="12.8" \
+       MAX_JOBS=4 \
+       pip install --no-cache-dir --no-deps --no-build-isolation . \
+    && rm -rf /tmp/spconv
+
+RUN python -c "import spconv; print(f'spconv installed: {spconv.__version__}')" \
+    && python -c "from spconv.cppconstants import CPU_ONLY_BUILD; print(f'spconv core_cc OK, CPU_ONLY={CPU_ONLY_BUILD}')"
+
+# ─── MinkowskiEngine (AzharSindhi fork for CUDA 12.x+) ────────────────────────
+# The official NVIDIA/MinkowskiEngine doesn't compile with CUDA 12.x.
+# This community fork fixes nvtx3 issues and deprecated C++ code.
+# Confirmed working: CUDA 13.0 + PyTorch 2.9.0 (26 stars, 4 forks)
+#
+# Source: https://github.com/AzharSindhi/MinkowskiEngineCuda13
+# Context: https://github.com/NVIDIA/MinkowskiEngine/issues/632
+
+RUN git clone -b cuda13-installation \
+        https://github.com/AzharSindhi/MinkowskiEngineCuda13.git \
+        /tmp/MinkowskiEngine \
+    && cd /tmp/MinkowskiEngine \
+    && TORCH_CUDA_ARCH_LIST="12.0" \
+       python setup.py install --blas=openblas --force_cuda \
+    && rm -rf /tmp/MinkowskiEngine
+
+RUN python -c "import MinkowskiEngine as ME; print(f'MinkowskiEngine installed: {ME.__version__}')"
+
+# ─── torch-scatter (prebuilt wheel from PyG) ──────────────────────────────────
+# Prebuilt wheels exist for torch 2.7.0 + cu128 on the PyG wheel index.
+RUN pip install --no-cache-dir \
+    torch-scatter \
+    -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+
+# ─── segmentator (ScanNet superpoint segmentation) ────────────────────────────
+# Builds a C++ extension using cmake + PyTorch's cmake prefix path.
+# The package loads its .so from csrc/build/ relative to the package root,
+# and 'make install' creates a symlink from site-packages/segmentator -> repo root.
+# Therefore the cloned directory MUST be kept (not deleted after build).
+# Cloned to /opt/segmentator (not /workspace) to avoid bind-mount shadowing.
+#
+# Python paths are hardcoded (Python 3.10 on Ubuntu 22.04) to avoid
+# nested-quote escaping issues in Dockerfile RUN commands.
+
+RUN git clone https://github.com/Karbo123/segmentator.git /opt/segmentator \
+    && cd /opt/segmentator \
+    && git reset --hard 76efe46d03dd27afa78df972b17d07f2c6cfb696 \
+    && sed -i 's/set(CMAKE_CXX_STANDARD 14)/set(CMAKE_CXX_STANDARD 17)/' csrc/CMakeLists.txt \
+    && cd csrc && mkdir build && cd build \
+    && cmake .. \
+        -DCMAKE_PREFIX_PATH="$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')" \
+        -DPYTHON_INCLUDE_DIR=/usr/include/python3.10 \
+        -DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython3.10.so \
+        -DCMAKE_INSTALL_PREFIX="$(python -c 'import site; print(site.getsitepackages()[0])')" \
+    && make \
+    && make install
+
+# ─── mmcv from source ─────────────────────────────────────────────────────────
+# No prebuilt mmcv wheel exists for cu128 + PyTorch 2.7. Must build from source.
+# Using mmcv 2.0.0 to match the upstream FF3D dependency pin.
+# IMPORTANT: Must use 'python setup.py install', NOT 'pip install -e .'
+# Modern pip (25.x) silently skips CUDA extension compilation via PEP 517 path.
+# Confirmed working on RTX 5090 + CUDA 12.8 by community (mmcv issue #3327).
+#
+# Source: https://github.com/open-mmlab/mmcv
+
+RUN git clone https://github.com/open-mmlab/mmcv.git /tmp/mmcv \
+    && cd /tmp/mmcv \
+    && git checkout v2.0.0 \
+    && sed -i "s/-std=c++14/-std=c++17/g" setup.py
+
+RUN cd /tmp/mmcv \
+    && MMCV_WITH_OPS=1 \
+       FORCE_CUDA=1 \
+       TORCH_CUDA_ARCH_LIST="12.0" \
+       MAX_JOBS=4 \
+       python setup.py install \
+    && rm -rf /tmp/mmcv
+
+# mmcv import verification deferred to after opencv-python is installed
+
+# ─── OpenMMLab stack (pure Python, pinned to match FF3D) ──────────────────────
+# These are installed with --no-deps to avoid pulling conflicting versions.
+# mmdetection3d is pinned to the exact commit used by ForestFormer3D.
+# mmdetection3d must use --no-build-isolation because its setup.py imports torch
+# at the top level, and PEP 517 build isolation creates a fresh venv without it.
+RUN pip install --no-deps --no-cache-dir \
+    mmengine==0.7.3 \
+    mmdet==3.0.0 \
+    mmsegmentation==1.0.0
+
+RUN pip install --no-deps --no-cache-dir --no-build-isolation \
+    "git+https://github.com/open-mmlab/mmdetection3d.git@22aaa47fdb53ce1870ff92cb7e3f96ae38d17f61"
+
+# ─── torch-cluster ────────────────────────────────────────────────────────────
+# Try prebuilt first, fall back to source build
+RUN pip install --no-cache-dir \
+    torch-cluster \
+    -f https://data.pyg.org/whl/torch-2.7.0+cu128.html \
+    || (echo "No prebuilt torch-cluster, building from source..." \
+        && FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="12.0" \
+           pip install --no-cache-dir --no-build-isolation torch-cluster)
+
+# ─── torch-points-kernels ────────────────────────────────────────────────────
+# This package (0.7.0) is unmaintained since 2022 and may have C++ ABI issues
+# with PyTorch 2.x. We attempt the install; if it fails, it needs patching.
+RUN FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="12.0" \
+    pip install --no-deps --no-cache-dir --no-build-isolation torch-points-kernels==0.7.0 \
+    || echo "WARNING: torch-points-kernels failed to build — will need patching"
+
+# ─── Remaining Python dependencies ────────────────────────────────────────────
+# Installed with --no-deps to prevent version conflicts.
+# numpy: let PyTorch's numpy stand (compatible with both 1.x and 2.x).
+# Not listed here: cumm-cu116 (the source-built cumm above provides it) and
+# pccm/ccimport (already installed as build tools above).
+RUN pip install --no-deps --no-cache-dir --ignore-installed \
+    addict==2.4.0 \
+    yapf==0.33.0 \
+    termcolor==2.3.0 \
+    packaging==23.1 \
+    rich==13.3.5 \
+    pyyaml \
+    tqdm \
+    prettytable \
+    fonttools \
+    pytz \
+    tzdata \
+    opencv-python==4.10.0.84 \
+    pycocotools==2.0.6 \
+    Shapely==1.8.5 \
+    scipy==1.10.1 \
+    terminaltables==3.1.10 \
+    numba==0.60.0 \
+    llvmlite==0.43.0 \
+    pyquaternion==0.9.9 \
+    lyft-dataset-sdk==0.0.8 \
+    pandas==2.0.1 \
+    python-dateutil==2.8.2 \
+    matplotlib==3.5.2 \
+    pyparsing==3.0.9 \
+    cycler==0.11.0 \
+    kiwisolver==1.4.4 \
+    scikit-learn==1.2.2 \
+    joblib==1.2.0 \
+    threadpoolctl==3.1.0 \
+    cachetools==5.3.0 \
+    nuscenes-devkit==1.1.10 \
+    trimesh==3.21.6 \
+    open3d==0.17.0 \
+    plotly==5.18.0 \
+    dash==2.14.2 \
+    plyfile==1.0.2 \
+    flask==3.0.0 \
+    werkzeug==3.0.1 \
+    click==8.1.7 \
+    blinker==1.7.0 \
+    itsdangerous==2.1.2 \
+    importlib_metadata==2.1.2 \
+    zipp==3.17.0 \
+    tensorboard==2.15.1 \
+    tensorboard-data-server==0.7.2 \
+    protobuf \
+    absl-py \
+    future \
+    MarkupSafe==2.0.1 \
+    markdown \
+    grpcio \
+    google-auth-oauthlib \
+    google-auth \
+    requests-oauthlib \
+    oauthlib \
+    debugpy
+
+# ─── laspy + LAZ support ──────────────────────────────────────────────────────
+RUN pip install --no-cache-dir laspy "laspy[lazrs]"
+
+# ─── numpy compatibility check ────────────────────────────────────────────────
+# Ensure numpy version is compatible with both PyTorch and the scientific stack
+RUN python -c "import numpy; print(f'numpy: {numpy.__version__}')"
+
+# ─── Full import verification ─────────────────────────────────────────────────
+# Verify all key compiled extensions load correctly now that all deps are present
+RUN python -c "\
+import torch; print(f'torch {torch.__version__}'); \
+import mmcv; print(f'mmcv {mmcv.__version__}'); \
+import spconv; print(f'spconv OK'); \
+import cumm; print(f'cumm {cumm.__version__}'); \
+import MinkowskiEngine; print(f'MinkowskiEngine OK'); \
+import segmentator; print(f'segmentator OK'); \
+print('All imports passed!')"
+
+# ─── Environment variables ────────────────────────────────────────────────────
+# PYTHONPATH: /workspace for FF3D project code, /workspace/oneformer3d for model
+# CUMM_CUDA_ARCH_LIST: persisted for runtime NVRTC kernel compilation
+ENV PYTHONPATH=/workspace:/workspace/oneformer3d
+ENV CUMM_CUDA_ARCH_LIST="12.0"
+
+# ─── Project setup ────────────────────────────────────────────────────────────
+WORKDIR /workspace
+COPY . /workspace
+
+RUN chmod +x /workspace/entrypoint_ff3d.sh /workspace/run_oracle_pipeline.sh
+
+ENTRYPOINT ["bash", "-lc", "set -euo pipefail; bash /workspace/entrypoint_ff3d.sh"]

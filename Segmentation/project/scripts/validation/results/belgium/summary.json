@@ -1,0 +1,70 @@
+{
+  "n_trees": 65,
+  "xgb_r2": 0.8539,
+  "xgb_rmse_m3": 0.2061,
+  "xgb_rrmse_pct": 22.4,
+  "freire_r2": 0.8221,
+  "n_features": 38,
+  "features": [
+    "n_total_points",
+    "H_max",
+    "H_min",
+    "H_mean",
+    "H_std",
+    "H_cv",
+    "H_p25",
+    "H_p50",
+    "H_p75",
+    "H_p90",
+    "H_p95",
+    "crown_area",
+    "crown_diameter",
+    "crown_base_height",
+    "crown_length",
+    "crown_volume",
+    "n_viable_heights",
+    "d_max",
+    "d_mean",
+    "viable_height_range",
+    "d_1.3m",
+    "n_smalian_sections",
+    "d_at_0.5m",
+    "d_at_1.0m",
+    "d_at_1.5m",
+    "d_at_2.0m",
+    "d_at_2.5m",
+    "d_at_3.0m",
+    "d_at_3.5m",
+    "d_at_4.0m",
+    "d_at_4.5m",
+    "d_at_5.0m",
+    "d_at_5.5m",
+    "d_at_6.0m",
+    "d_at_6.5m",
+    "d_at_7.0m",
+    "d_at_7.5m",
+    "d_at_8.0m"
+  ],
+  "importance_top5": [
+    [
+      "d_at_0.5m",
+      0.5005279258973615
+    ],
+    [
+      "d_1.3m",
+      0.02380004101435521
+    ],
+    [
+      "d_at_1.0m",
+      0.02342451563634353
+    ],
+    [
+      "crown_volume",
+      0.016050645896921237
+    ],
+    [
+      "d_at_6.5m",
+      0.012122836929403184
+    ]
+  ]
+}
